@@ -1,0 +1,4 @@
+Computer
+SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer
+SettingsPageVisibility
+SZ:hide:gaming-gamebar;gaming-gamedvr;gaming-broadcasting;gaming-gamemode;gaming-trueplay;gaming-xboxnetworking

@@ -1,0 +1,4 @@
+User
+SOFTWARE\Policies\Microsoft\OneDrive
+DisablePersonalSync
+DWORD:1

@@ -1,0 +1,4 @@
+User
+SOFTWARE\Policies\Microsoft\Windows\Explorer
+HidePeopleBar
+DWORD:1

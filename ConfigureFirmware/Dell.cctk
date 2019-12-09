@@ -1,0 +1,5 @@
+[cctk]
+virtualization=enable
+vtfordirectio=on
+tpm=on
+tpmactivation=activate

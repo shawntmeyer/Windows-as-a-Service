@@ -1,0 +1,4 @@
+[cctk]
+legacyorom=disable
+bootorder=uefitype,+hdd,+uefi.1,+uefi.2
+secureboot=enable

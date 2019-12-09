@@ -1,0 +1,4 @@
+Computer
+SOFTWARE\Policies\Microsoft\Windows\CloudContent
+DisableWindowsConsumerFeatures
+DWORD:1

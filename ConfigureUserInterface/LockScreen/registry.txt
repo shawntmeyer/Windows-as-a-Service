@@ -1,0 +1,22 @@
+; ----------------------------------------------------------------------
+; PARSING COMPUTER POLICY
+; Source file:  ..\lockscreen\registry.pol
+
+Computer
+Software\Policies\Microsoft\Windows\Personalization
+LockScreenImage
+SZ:c:\\windows\\web\\screen\\lockscreen.jpg
+
+;Computer
+;Software\Policies\Microsoft\Windows\Personalization
+;LockScreenOverlaysDisabled
+;DWORD:1
+
+;Computer
+;Software\Policies\Microsoft\Windows\Personalization
+;NoChangingLockScreen
+;DWORD:1
+
+; PARSING COMPLETED.
+; ----------------------------------------------------------------------
+

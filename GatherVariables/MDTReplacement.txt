@@ -1,0 +1,3 @@
+PowerShell script that replaces MDT Gather step during OS deployment
+
+https://gallery.technet.microsoft.com/PowerShell-script-that-a8a7bdd8
