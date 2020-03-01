@@ -15,17 +15,23 @@
 		Specifies the full path to a CSV file with Application Display Names in Add/Remove Programs and the corresponding
         Application Name in SCCM. This can be a relative path (i.e., .\ApplicationMapping.csv) or a literal path (i.e., http://webserver.domain.com/applicationmapping.csv)
 
-    .PARAMETER Exact
+        .PARAMETER MatchType
 	    
-        Specifies that the named application must be matched using the exact name. Performs a contains match on the application display name by default.
-    
-    .PARAMETER WildCard
-	    
-        Specifies that the named application must be matched using a wildcard search. Performs a contains match on the application display name by default.
-    
-    .PARAMETER RegEx
-	
-        Specifies that the named application must be matched using a regular expression search. Performs a contains match on the application display name by default.
+        Specifies the type of match that is performed when comparing the search term to the list of applications found on the computer. The script performs a contains match on the
+        application display name by default but can also use:
+            Exact -    Specifies that the named application must match exactly to the found application.
+            RegEx -    Specifies that the named application must be matched using a regular expression search.
+            WildCard - Specifies that the named application must be matched using a wildcard search.
+
+    .Replace
+
+        Switch Parameter to instruct script to pull list of applications from Configuration Manager database for a source computer via a Computer Association. Requires
+        Read Rights to Configuration Manager. Easiest method is to grant Domain Computers the Read Only Analyst role in Configuration Manager Security. Must also have a
+        computer associationm between the new computer and the old computer or no apps will be returned.
+
+    .SiteServer
+
+        Specifies the Configuration Manager Site Server name. Best practice is to use FQDN. Possible way to specify this value is to specify the parameter to be equal to %_SMSTSMP% during a task sequence.
 	
 	.EXAMPLE
 
@@ -35,23 +41,32 @@
 
         Get-ApplicationMapping -BaseVariableName "Applications" -ApplicationList "http://webserver.contoso.com/osd/applicationmapping.csv")
 
+    .EXAMPLE
+
+        Get-ApplicationMapping -BaseVariableName "Applications" -ApplicationList "ApplicationMapping.csv" -Replace -SiteServer "ConfigMgr.contoso.com"
+
 	.NOTES
 
 		Shawn Meyer, Microsoft PFE
+        03/01/2020 - Added Replace switch and capabilities to search Configuration Manager for a computer association and restore apps in the replace scenario.
         12/17/2018 - Added the logging of unmatched apps to a new text file called unmatchedapps.txt in the resolved log directory.
 #>
 
-
+[CmdletBinding(DefaultParameterSetName='Default')]
 PARAM
-    (
-        [String]$BaseVariableName='Applications',		
-        $ApplicationList=".\ApplicationMapping.csv",
-        [switch]$Exact = $false,
-		[Parameter(Mandatory=$false)]
-		[switch]$WildCard = $false,
-		[Parameter(Mandatory=$false)]
-		[switch]$RegEx = $false
-	)
+(
+    [String]$BaseVariableName='Applications',
+
+    [string]$ApplicationList=".\ApplicationMapping.csv",
+
+    [ValidateSet('Contains','Exact', 'RegEx','Wildcard')]
+    [string]$MatchType = 'Contains',
+
+    [Parameter(ParameterSetName='Replace')]
+	[switch]$Replace,
+    [Parameter(Mandatory=$true)]
+    [string]$SiteServer
+)
 
 
 #region Global Variables
@@ -582,117 +597,192 @@ Function Resolve-Error {
 
 $LogDirectory = Get-LogDir
 
-$Script:Phase='Online or Offline?'
-
-# Determine if Offline or Online
-
-if ($env:SYSTEMDRIVE -eq "X:")
-{
-    $script:Offline = $true
-    Write-Log "Script is running in WinPE. Now searching for Offline Windows Drive." -source 'Main()'
-
-    # Find Windows
-    $drives = get-volume | ? {-not [String]::IsNullOrWhiteSpace($_.DriveLetter) } | ? {$_.DriveType -eq 'Fixed'} | ? {$_.DriveLetter -ne 'X'}
-    $drives | ? { Test-Path "$($_.DriveLetter):\Windows\System32"} | % { $script:OfflinePath = "$($_.DriveLetter):\" }
-    Write-Log "Eligible offline drive found: $script:OfflinePath" -ScriptSection $Script:Phase -Source Main
-    
-    $SoftwareHiveFile = $Script:OfflinePath + "Windows\System32\config\SOFTWARE"
-
-    If (-not (Test-Path $SoftwareHiveFile) )
-    {
-        Write-Log "Not able to find offline Software Hive File. Exiting Script." -Severity 2 -Source 'Main()'
-        Exit(0)
-    }
-    
-    Write-Log "Loading Software Hive File to WINPE registry." -Source 'Main()'
-
-    Reg Load "HKLM\Offline" "$SoftwareHiveFile"
-    [string[]]$regKeyApplications = 'HKLM:Offline\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:Offline\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-}
-else
-{
-    Write-Log "Running in the full OS." -ScriptSection $Script:Phase -Source Main
-    $script:Offline = $false
-    [string[]]$regKeyApplications = 'HKLM:SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-}
-
 ## Check if script is running from a SCCM Task Sequence
 $Script:Phase = 'Is Task Sequence?'
 Try
 {
 	$TSEnv = New-Object -ComObject 'Microsoft.SMS.TSEnvironment' -ErrorAction 'Stop'
-	Write-Log -Message "Script is currently running from a SCCM Task Sequence." -Source Main
+	Write-Log -Message "Script is currently running from a SCCM Task Sequence." -Source 'Main()'
 	$runningTaskSequence = $true
 }
 Catch
 {
-	Write-Log -Message "Script is not currently running from a Task Sequence." -Source Main
+	Write-Log -Message "Script is not currently running from a Task Sequence." -Source 'Main()'
 	$runningTaskSequence = $false
 }
 
-$Script:Phase = 'Get Installed Applications'
- ## Enumerate the installed applications from the registry for applications that have the "DisplayName" property
- ## Add them to an array list for searching later.
-
-[psobject[]]$regKeyApplication = @()
-
-ForEach ($regKey in $regKeyApplications)
+If ($Replace)
 {
-    If (Test-Path -LiteralPath $regKey -ErrorAction 'SilentlyContinue' -ErrorVariable '+ErrorUninstallKeyPath')
-    {
-        Write-Log "Now Enumerating the installed applications in $regKey" -Source 'Main()'
-        # create a Powershell Object containing all the child keys of the 'Uninstall' Registry Paths.
-		[psobject[]]$UninstallKeyApps = Get-ChildItem -LiteralPath $regKey -ErrorAction 'SilentlyContinue' -ErrorVariable '+ErrorUninstallKeyPath'
-		ForEach ($UninstallKeyApp in $UninstallKeyApps)
-        {
-			Try
-            {
-				[psobject]$regKeyApplicationProps = Get-ItemProperty -LiteralPath $UninstallKeyApp.PSPath -ErrorAction 'Stop'
-                # Add current registry object to $RegKeyApplication Object
-				If ($regKeyApplicationProps.DisplayName) { [psobject[]]$regKeyApplication += $regKeyApplicationProps }
-			}
-			Catch
-            {
-				Write-Output "Unable to enumerate properties from registry key path [$($UninstallKeyApp.PSPath)]"
-				Continue
-			}
-		}
-    }
-}
-
-If ($ErrorUninstallKeyPath)
-{
-    Write-Log -Message "The following error(s) took place while enumerating installed applications from the registry. `n$(Resolve-Error -ErrorRecord $ErrorUninstallKeyPath)" -Severity 2 -Source 'Main()'
-}
-
-## Create an array to hold the sanitized displaynames of all installed apps.
-
-[string[]]$InstalledApps = @()
-
-ForEach ($regKeyApp in $regKeyApplication)
-{
+    $Script:Phase = 'Get Source Computer Installed Applications'
+    
     Try
     {
-	    [string]$appDisplayName = ''
-				
-	    ## Bypass any updates or hotfixes
-	    If ($regKeyApp.DisplayName -match '(?i)kb\d+') { Continue }
-	    If ($regKeyApp.DisplayName -match 'Cumulative Update') { Continue }
-	    If ($regKeyApp.DisplayName -match 'Security Update') { Continue }
-	    If ($regKeyApp.DisplayName -match 'Hotfix') { Continue }
-				
-		## Remove any control characters which may interfere with logging and creating file path names from these variables
-		$appDisplayName = $regKeyApp.DisplayName -replace '[^\u001F-\u007F]',''	
-        $InstalledApps += $appDisplayName
+
+        Try
+        {
+            $SMSProvider = Get-WmiObject -Namespace 'root\SMS' -Class 'SMS_ProviderLocation' -ComputerName $SiteServer -ErrorAction STOP
+            $ObjNS = Get-WmiObject -Namespace 'root\SMS' -class '__Namespace' -ComputerName $SiteServer -ErrorAction STOP
+            $SiteCode= $ObjNS.Name.Substring(5,3)
+        }
+        Catch
+        {
+            Write-Log -Message "Unable to connect to Site Server to find the SMSProvider and determine site code. `n$(Resolve-Error)" -Severity 3 -Source 'Main()'
+            Continue
+        }
+        $ComputerName = $env:ComputerName
+        $ObjSM = Get-WmiObject -ComputerName $SMSProvider -Namespace root/SMS/Site_$SiteCode -Class SMS_StateMigration -Filter "RestoreName='$ComputerName'" -ErrorAction Stop
+        $SourceComputer = $ObjSM.SourceName
+        Write-Log -Message "Found source computer in Configuration Manager database. Source Computer is `"$SourceComputer`"." -Source 'Main()'
+
     }
     Catch
     {
-        Write-Log -Message "Failed to resolve application details from registry for [$appDisplayName]. `n$(Resolve-Error)" -Severity 3 -Source 'Main()'
-		Continue
+        Write-Log -Message "Unable to connect to Site SMSProvider and determine source computer. `n$(Resolve-Error)" -Severity 3 -Source 'Main()'
+        Continue
     }
-}
 
-Write-Log -message "Found a total of $($installedApps.count) on System" -Source 'Main()'
+    If ($SourceComputer -ne $null)
+    {
+        $Query = "Select ARPDisplayName from SMS_G_System_Installed_Software JOIN SMS_R_System ON SMS_R_System.ResourceID = SMS_G_System_Installed_Software.ResourceID where SMS_R_System.NetbiosName='$Sourcecomputer'"
+        $Applications = Get-WmiObject -Query $Query -ComputerName $SMSProvider -Namespace root/SMS/Site_$SiteCode | Where-Object {$_.ARPDisplayName -ne $null -and $_.ARPDisplayName -ne '' }
+
+        ## Create an array to hold the sanitized displaynames of all installed apps.
+
+        [string[]]$InstalledApps = @()
+
+        ForEach ($App in $Applications)
+        {
+            Try
+            {
+	            [string]$appName = ''
+				
+	            ## Bypass any updates or hotfixes
+	            If ($App.ARPDisplayName -match '(?i)kb\d+') { Continue }
+	            If ($App.ARPDisplayName -match 'Cumulative Update') { Continue }
+	            If ($App.ARPDisplayName -match 'Security Update') { Continue }
+	            If ($App.ARPDisplayName -match 'Hotfix') { Continue }
+				
+		        ## Remove any control characters which may interfere with logging and creating file path names from these variables
+		        $AppName = $App.ARPDisplayName -replace '[^\u001F-\u007F]',''	
+                $InstalledApps += $AppName
+            }
+            Catch
+            {
+                Write-Log -Message "Failed to resolve application details from registry for [$appDisplayName]. `n$(Resolve-Error)" -Severity 3 -Source 'Main()'
+		        Continue
+            }
+        }
+
+        Write-Log -message "Found a total of $($installedApps.count) on $SourceComputer from Configuration Manager Asset Intelligence classes." -Source 'Main()'
+    }
+    Else
+    {
+        Write-Log -Message "No Source Computer found. Exiting Script." -Severity 2 -Source 'Main()'
+        Exit(0)
+    }
+
+}
+Else
+{
+
+    $Script:Phase='Online or Offline?'
+
+    # Determine if Offline or Online
+    if ($env:SYSTEMDRIVE -eq "X:")
+    {
+        $script:Offline = $true
+        Write-Log "Script is running in WinPE. Now searching for Offline Windows Drive." -source 'Main()'
+
+        # Find Windows
+        $drives = get-volume | ? {-not [String]::IsNullOrWhiteSpace($_.DriveLetter) } | ? {$_.DriveType -eq 'Fixed'} | ? {$_.DriveLetter -ne 'X'}
+        $drives | ? { Test-Path "$($_.DriveLetter):\Windows\System32"} | % { $script:OfflinePath = "$($_.DriveLetter):\" }
+        Write-Log "Eligible offline drive found: $script:OfflinePath" -ScriptSection $Script:Phase -Source Main
+    
+        $SoftwareHiveFile = $Script:OfflinePath + "Windows\System32\config\SOFTWARE"
+
+        If (-not (Test-Path $SoftwareHiveFile) )
+        {
+            Write-Log "Not able to find offline Software Hive File. Exiting Script." -Severity 2 -Source 'Main()'
+            Exit(0)
+        }
+    
+        Write-Log "Loading Software Hive File to WINPE registry." -Source 'Main()'
+
+        Reg Load "HKLM\Offline" "$SoftwareHiveFile"
+        [string[]]$regKeyApplications = 'HKLM:Offline\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:Offline\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    }
+    else
+    {
+        Write-Log "Running in the full OS." -ScriptSection $Script:Phase -Source Main
+        $script:Offline = $false
+        [string[]]$regKeyApplications = 'HKLM:SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    }
+
+    $Script:Phase = 'Get Installed Applications'
+    ## Enumerate the installed applications from the registry for applications that have the "DisplayName" property
+    ## Add them to an array list for searching later.
+
+    [psobject[]]$regKeyApplication = @()
+
+    ForEach ($regKey in $regKeyApplications)
+    {
+        If (Test-Path -LiteralPath $regKey -ErrorAction 'SilentlyContinue' -ErrorVariable '+ErrorUninstallKeyPath')
+        {
+            Write-Log "Now Enumerating the installed applications in $regKey" -Source 'Main()'
+            # create a Powershell Object containing all the child keys of the 'Uninstall' Registry Paths.
+		    [psobject[]]$UninstallKeyApps = Get-ChildItem -LiteralPath $regKey -ErrorAction 'SilentlyContinue' -ErrorVariable '+ErrorUninstallKeyPath'
+		    ForEach ($UninstallKeyApp in $UninstallKeyApps)
+            {
+			    Try
+                {
+				    [psobject]$regKeyApplicationProps = Get-ItemProperty -LiteralPath $UninstallKeyApp.PSPath -ErrorAction 'Stop'
+                    # Add current registry object to $RegKeyApplication Object
+				    If ($regKeyApplicationProps.DisplayName) { [psobject[]]$Applications += $regKeyApplicationProps }
+			    }
+			    Catch
+                {
+				    Write-Output "Unable to enumerate properties from registry key path [$($UninstallKeyApp.PSPath)]"
+				    Continue
+			    }
+		    }
+        }
+    }
+
+    If ($ErrorUninstallKeyPath)
+    {
+        Write-Log -Message "The following error(s) took place while enumerating installed applications from the registry. `n$(Resolve-Error -ErrorRecord $ErrorUninstallKeyPath)" -Severity 2 -Source 'Main()'
+    }
+
+    ## Create an array to hold the sanitized displaynames of all installed apps.
+
+    [string[]]$InstalledApps = @()
+
+    ForEach ($App in $Applications)
+    {
+        Try
+        {
+	        [string]$AppName = ''
+				
+	        ## Bypass any updates or hotfixes
+	        If ($App.DisplayName -match '(?i)kb\d+') { Continue }
+	        If ($App.DisplayName -match 'Cumulative Update') { Continue }
+	        If ($App.DisplayName -match 'Security Update') { Continue }
+	        If ($App.DisplayName -match 'Hotfix') { Continue }
+				
+		    ## Remove any control characters which may interfere with logging and creating file path names from these variables
+		    $AppName = $App.DisplayName -replace '[^\u001F-\u007F]',''	
+            $InstalledApps += $AppName
+        }
+        Catch
+        {
+            Write-Log -Message "Failed to resolve application details from registry for [$appDisplayName]. `n$(Resolve-Error)" -Severity 3 -Source 'Main()'
+		    Continue
+        }
+    }
+
+    Write-Log -message "Found a total of $($installedApps.count) on System" -Source 'Main()'
+
+}
 
 $Script:Phase = 'Load Mapping List'
 
@@ -724,7 +814,7 @@ ForEach($application in $appMappingList)
     {
         $applicationMatched = $false 
         Write-Log -Message "Installed App Display Name = $installedApp" -Source 'Main()'
-        If ($exact)
+        If ($MatchType -eq 'Exact')
         {
             #  Check for an exact application name match
 		    If ($InstalledApp -eq $application.ArpName)
@@ -733,7 +823,7 @@ ForEach($application in $appMappingList)
 			    Write-Log -Message "$installedApp is an exact match for search term [$($application.arpname)]." -Source 'Main()'
 		    }
 	    }
-	    ElseIf ($WildCard)
+	    ElseIf ($MatchType -eq 'WildCard')
         {
 	        #  Check for wildcard application name match
 	        If ($InstalledApp -like $application.ArpName)
@@ -742,7 +832,7 @@ ForEach($application in $appMappingList)
 			    Write-Log -Message "$InstalledApp is a wildcard match for search term [$($application.arpname)]." -Source 'Main()'
 		    }
 	    }
-	    ElseIf ($RegEx)
+	    ElseIf ($MatchType -eq 'RegEx')
         {
 	        #  Check for a regex application name match
 		    If ($InstalledApp -match $application.ArpName)
@@ -751,11 +841,15 @@ ForEach($application in $appMappingList)
 			    Write-Log -Message "$InstalledApp is a regex match for search term [$($application.arpname)]." -Source 'Main()'
 		    }
 	    }
-	    #  Check for a contains application name match
-	    ElseIf ($InstalledApp -match [regex]::Escape($application.ArpName))
+
+	    Else
         {
-			$applicationMatched = $true
-			Write-Log -Message "$InstalledApp is contains the search term [$($application.arpname)]." -Source 'Main()'
+            #  Check for a contains application name match
+            If ($InstalledApp -match [regex]::Escape($application.ArpName))
+            {
+			    $applicationMatched = $true
+			    Write-Log -Message "$InstalledApp is contains the search term [$($application.arpname)]." -Source 'Main()'
+            }
         }
 
         If ($ApplicationMatched -eq $True)
